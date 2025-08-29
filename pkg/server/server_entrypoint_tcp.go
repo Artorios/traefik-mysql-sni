@@ -101,7 +101,7 @@ func NewTCPEntryPoints(entryPointsConfig static.EntryPoints, hostResolverConfig 
 			return nil, fmt.Errorf("error while building entryPoint %s: %w", entryPointName, err)
 		}
 
-		if protocol != "tcp" {
+		if protocol != "tcp" && protocol != "mysql" {
 			continue
 		}
 

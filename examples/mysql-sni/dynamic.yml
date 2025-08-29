@@ -1,0 +1,54 @@
+# Dynamic Configuration for MySQL SNI Routing
+
+tcp:
+  routers:
+    # Route for MySQL database 1
+    mysql-db1:
+      rule: "HostSNI(`db1.example.com`)"
+      entryPoints:
+        - mysql
+      service: mysql-db1-service
+      tls: {}
+
+    # Route for MySQL database 2  
+    mysql-db2:
+      rule: "HostSNI(`db2.example.com`)"
+      entryPoints:
+        - mysql
+      service: mysql-db2-service
+      tls: {}
+
+    # Default route for connections without specific SNI
+    mysql-default:
+      rule: "HostSNI(`*`)"
+      entryPoints:
+        - mysql
+      service: mysql-default-service
+      priority: 1
+
+  services:
+    # MySQL Database 1 Service
+    mysql-db1-service:
+      loadBalancer:
+        servers:
+          - address: "mysql-db1:3306"
+
+    # MySQL Database 2 Service
+    mysql-db2-service:
+      loadBalancer:
+        servers:
+          - address: "mysql-db2:3306"
+
+    # Default MySQL Service
+    mysql-default-service:
+      loadBalancer:
+        servers:
+          - address: "mysql-default:3306"
+
+# TLS Configuration
+tls:
+  certificates:
+    - certFile: /etc/traefik/certs/db1.example.com.crt
+      keyFile: /etc/traefik/certs/db1.example.com.key
+    - certFile: /etc/traefik/certs/db2.example.com.crt
+      keyFile: /etc/traefik/certs/db2.example.com.key

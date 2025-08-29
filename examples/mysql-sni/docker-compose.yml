@@ -1,0 +1,93 @@
+version: '3.8'
+
+services:
+  traefik:
+    image: traefik:v3.0
+    command:
+      - --api.dashboard=true
+      - --api.insecure=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.mysql.address=:3306/mysql
+      - --entrypoints.mysql.mysql.sniRequired=true
+      - --log.level=DEBUG
+    ports:
+      - "3306:3306"
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - mysql-network
+
+  mysql-db1:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: testdb1
+      MYSQL_USER: testuser
+      MYSQL_PASSWORD: testpass
+    labels:
+      - traefik.enable=true
+      - traefik.tcp.routers.mysql-db1.rule=HostSNI(`db1.example.com`)
+      - traefik.tcp.routers.mysql-db1.entrypoints=mysql
+      - traefik.tcp.routers.mysql-db1.service=mysql-db1-service
+      - traefik.tcp.services.mysql-db1-service.loadbalancer.server.port=3306
+      - traefik.tcp.routers.mysql-db1.tls=true
+    volumes:
+      - mysql-db1-data:/var/lib/mysql
+      - ./certs/db1.example.com.crt:/etc/mysql/server-cert.pem:ro
+      - ./certs/db1.example.com.key:/etc/mysql/server-key.pem:ro
+      - ./mysql-config/db1.cnf:/etc/mysql/conf.d/ssl.cnf:ro
+    networks:
+      - mysql-network
+
+  mysql-db2:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: testdb2
+      MYSQL_USER: testuser
+      MYSQL_PASSWORD: testpass
+    labels:
+      - traefik.enable=true
+      - traefik.tcp.routers.mysql-db2.rule=HostSNI(`db2.example.com`)
+      - traefik.tcp.routers.mysql-db2.entrypoints=mysql
+      - traefik.tcp.routers.mysql-db2.service=mysql-db2-service
+      - traefik.tcp.services.mysql-db2-service.loadbalancer.server.port=3306
+      - traefik.tcp.routers.mysql-db2.tls=true
+    volumes:
+      - mysql-db2-data:/var/lib/mysql
+      - ./certs/db2.example.com.crt:/etc/mysql/server-cert.pem:ro
+      - ./certs/db2.example.com.key:/etc/mysql/server-key.pem:ro
+      - ./mysql-config/db2.cnf:/etc/mysql/conf.d/ssl.cnf:ro
+    networks:
+      - mysql-network
+
+  # Default MySQL instance (for connections without SNI)
+  mysql-default:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: defaultdb
+      MYSQL_USER: testuser
+      MYSQL_PASSWORD: testpass
+    labels:
+      - traefik.enable=true
+      - traefik.tcp.routers.mysql-default.rule=HostSNI(`*`)
+      - traefik.tcp.routers.mysql-default.entrypoints=mysql
+      - traefik.tcp.routers.mysql-default.service=mysql-default-service
+      - traefik.tcp.services.mysql-default-service.loadbalancer.server.port=3306
+      - traefik.tcp.routers.mysql-default.priority=1
+    volumes:
+      - mysql-default-data:/var/lib/mysql
+    networks:
+      - mysql-network
+
+volumes:
+  mysql-db1-data:
+  mysql-db2-data:
+  mysql-default-data:
+
+networks:
+  mysql-network:
+    driver: bridge

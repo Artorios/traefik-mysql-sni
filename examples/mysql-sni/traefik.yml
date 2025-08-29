@@ -1,0 +1,41 @@
+# Traefik Configuration for MySQL SNI Routing
+
+# Entry Points
+entryPoints:
+  web:
+    address: ":80"
+  
+  websecure:
+    address: ":443"
+  
+  # MySQL EntryPoint with SNI support
+  mysql:
+    address: ":3306/mysql"
+    mysql:
+      sniRequired: true
+
+# Providers
+providers:
+  # File provider for static configuration
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+# API and Dashboard
+api:
+  dashboard: true
+  insecure: true
+
+# Logging
+log:
+  level: INFO
+
+# Access Logs (optional)
+accessLog:
+  filePath: "/var/log/traefik/access.log"
+
+# Metrics (optional)
+metrics:
+  prometheus:
+    addEntryPointsLabels: true
+    addServicesLabels: true

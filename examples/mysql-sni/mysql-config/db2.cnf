@@ -1,0 +1,21 @@
+[mysqld]
+# SSL Configuration
+ssl-ca=/etc/mysql/ca-cert.pem
+ssl-cert=/etc/mysql/server-cert.pem
+ssl-key=/etc/mysql/server-key.pem
+
+# Require SSL for connections
+require_secure_transport=ON
+
+# Enable TLS 1.2 and 1.3
+tls_version=TLSv1.2,TLSv1.3
+
+# Server ID for replication (if needed)
+server-id=2
+
+# Bind to all interfaces
+bind-address=0.0.0.0
+
+# Character set
+character-set-server=utf8mb4
+collation-server=utf8mb4_unicode_ci

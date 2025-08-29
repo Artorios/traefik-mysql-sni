@@ -23,6 +23,7 @@ type EntryPoint struct {
 	HTTP2            *HTTP2Config          `description:"HTTP/2 configuration." json:"http2,omitempty" toml:"http2,omitempty" yaml:"http2,omitempty" export:"true"`
 	HTTP3            *HTTP3Config          `description:"HTTP/3 configuration." json:"http3,omitempty" toml:"http3,omitempty" yaml:"http3,omitempty" label:"allowEmpty" file:"allowEmpty" export:"true"`
 	UDP              *UDPConfig            `description:"UDP configuration." json:"udp,omitempty" toml:"udp,omitempty" yaml:"udp,omitempty"`
+	MySQL            *MySQLConfig          `description:"MySQL configuration." json:"mysql,omitempty" toml:"mysql,omitempty" yaml:"mysql,omitempty" export:"true"`
 	Observability    *ObservabilityConfig  `description:"Observability configuration." json:"observability,omitempty" toml:"observability,omitempty" yaml:"observability,omitempty" export:"true"`
 }
 
@@ -42,7 +43,7 @@ func (ep *EntryPoint) GetProtocol() (string, error) {
 	}
 
 	protocol := strings.ToLower(splitN[1])
-	if protocol == "tcp" || protocol == "udp" {
+	if protocol == "tcp" || protocol == "udp" || protocol == "mysql" {
 		return protocol, nil
 	}
 
@@ -60,6 +61,8 @@ func (ep *EntryPoint) SetDefaults() {
 	ep.HTTP.SetDefaults()
 	ep.HTTP2 = &HTTP2Config{}
 	ep.HTTP2.SetDefaults()
+	ep.MySQL = &MySQLConfig{}
+	ep.MySQL.SetDefaults()
 }
 
 // HTTPConfig is the HTTP configuration of an entry point.
@@ -161,6 +164,16 @@ type UDPConfig struct {
 // SetDefaults sets the default values.
 func (u *UDPConfig) SetDefaults() {
 	u.Timeout = ptypes.Duration(DefaultUDPTimeout)
+}
+
+// MySQLConfig is the MySQL configuration of an entry point.
+type MySQLConfig struct {
+	SNIRequired bool `description:"Requires SNI for MySQL connections." json:"sniRequired,omitempty" toml:"sniRequired,omitempty" yaml:"sniRequired,omitempty" export:"true"`
+}
+
+// SetDefaults sets the default values.
+func (m *MySQLConfig) SetDefaults() {
+	m.SNIRequired = false
 }
 
 // ObservabilityConfig holds the observability configuration for an entry point.

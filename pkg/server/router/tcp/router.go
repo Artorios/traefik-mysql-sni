@@ -118,6 +118,25 @@ func (r *Router) ServeTCP(conn tcp.WriteCloser) {
 
 	// TODO -- Check if ProxyProtocol changes the first bytes of the request
 	br := bufio.NewReader(conn)
+	
+	// Check for MySQL handshake first
+	mysql, err := isMySQLHandshake(br)
+	if err != nil {
+		conn.Close()
+		return
+	}
+
+	if mysql {
+		// Remove read/write deadline and delegate this to underlying TCP server.
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			log.Error().Err(err).Msg("Error while setting deadline")
+		}
+
+		r.serveMySQL(r.GetConn(conn, getPeeked(br)))
+		return
+	}
+	
+	// Check for PostgreSQL STARTTLS
 	postgres, err := isPostgres(br)
 	if err != nil {
 		conn.Close()
