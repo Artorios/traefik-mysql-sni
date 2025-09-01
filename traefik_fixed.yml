@@ -1,0 +1,19 @@
+log:
+  level: DEBUG
+
+accessLog: {}
+
+entryPoints:
+  web:
+    address: ":80"
+  mysql:
+    address: ":3306/mysql"
+
+api:
+  dashboard: true
+  insecure: true  # ⚠️ только для теста
+
+providers:
+  file:
+    directory: ./dynamic   # динамические конфиги в ./dynamic
+    watch: true

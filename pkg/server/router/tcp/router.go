@@ -48,6 +48,10 @@ type Router struct {
 	// hostHTTPTLSConfig contains TLS configs keyed by SNI.
 	// A nil config is the hint to set up a brokenTLSRouter.
 	hostHTTPTLSConfig map[string]*tls.Config // TLS configs keyed by SNI
+
+	// Protocol indicates the expected protocol for this router (e.g., "tcp", "mysql", "postgres").
+	// Empty string means default TCP behavior.
+	protocol string
 }
 
 type MySQLPacketHeader struct {
@@ -314,64 +318,51 @@ func (r *Router) ServeTCP(conn tcp.WriteCloser) {
 	// TODO -- Check if ProxyProtocol changes the first bytes of the request
 	br := bufio.NewReader(conn)
 	////////////////////////////////////////////////////////////////////////////////////////////////
-	if err := sendFakeMySQLGreetingForceSSL(conn); err != nil {
-		log.Error().Err(err).Msg("failed to send fake mysql greeting")
-		conn.Close()
-		return
-	}
-
-	log.Info().Msg("Fake MySQL greeting sent, waiting for client response")
-
-	packetTLS, _ := readMysqlAnswer(conn)
-	log.Info().Msgf("\npayload:%s", dumpHex(packetTLS.Payload))
-	br = getTLSbody(conn)
-
-	//hello1, err1 := clientHelloInfo(br)
-	//if err1 != nil {
-	//	conn.Close()
-	//	return
-	//}
-	//log.Info().Msgf("\npayload:%s", hello1.serverName)
-
-	//// Check for MySQL handshake first
-	//mysql, err := isMySQLHandshake(br)
-	//if err != nil {
-	//	log.Info().Msg("isMySQLHandshake => false, close connection")
-	//	conn.Close()
-	//	return
-	//}
-	//
-	//log.Info().Msg("isMySQLHandshake => true")
-	//
-	//if mysql {
-	//	log.Info().Msg("\n\n\nMySQLHandshake Detected!!!!\n\n\n")
-	//	// Remove read/write deadline and delegate this to underlying TCP server.
-	//	if err := conn.SetDeadline(time.Time{}); err != nil {
-	//		log.Error().Err(err).Msg("Error while setting deadline")
-	//	}
-	//
-	//	r.serveMySQL(r.GetConn(conn, getPeeked(br)))
-	//	return
-	//}
-
 	/*
-		// Check for PostgreSQL STARTTLS
-		postgres, err := isPostgres(br)
-		if err != nil {
+		if err := sendFakeMySQLGreetingForceSSL(conn); err != nil {
+			log.Error().Err(err).Msg("failed to send fake mysql greeting")
 			conn.Close()
 			return
 		}
 
-		if postgres {
-			// Remove read/write deadline and delegate this to underlying TCP server.
-			if err := conn.SetDeadline(time.Time{}); err != nil {
-				log.Error().Err(err).Msg("Error while setting deadline")
-			}
+		log.Info().Msg("Fake MySQL greeting sent, waiting for client response")
 
-			r.servePostgres(r.GetConn(conn, getPeeked(br)))
-			return
-		}
+		packetTLS, _ := readMysqlAnswer(conn)
+		log.Info().Msgf("\npayload:%s", dumpHex(packetTLS.Payload))
+		br = getTLSbody(conn)
 	*/
+	////////////////////////////////////////////////////////////////////////////////////////////////
+
+	log.Debug().Str("protocol", r.GetProtocol()).Bool("isMySQL", r.IsMySQL()).Msg("Checking router protocol")
+
+	if r.IsMySQL() {
+		log.Debug().Msg("Router configured for MySQL protocol - routing to serveMySQL")
+		// Remove read/write deadline and delegate this to underlying TCP server.
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			log.Error().Err(err).Msg("Error while setting deadline")
+		}
+
+		r.serveMySQL(r.GetConn(conn, getPeeked(br)))
+		return
+	}
+
+	// Check for PostgreSQL STARTTLS
+	postgres, err := isPostgres(br)
+	if err != nil {
+		conn.Close()
+		return
+	}
+
+	if postgres {
+		// Remove read/write deadline and delegate this to underlying TCP server.
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			log.Error().Err(err).Msg("Error while setting deadline")
+		}
+
+		r.servePostgres(r.GetConn(conn, getPeeked(br)))
+		return
+	}
+
 	hello, err := clientHelloInfo(br)
 	if err != nil {
 		conn.Close()
@@ -557,8 +548,23 @@ func (r *Router) SetHTTPSHandler(handler http.Handler, config *tls.Config) {
 	r.httpsTLSConfig = config
 }
 
+func (r *Router) SetProtocol(protocol string) {
+	log.Debug().Str("protocol", protocol).Msg("Setting router protocol")
+	r.protocol = protocol
+}
+
 func (r *Router) EnableACMETLSPassthrough() {
 	r.acmeTLSPassthrough = true
+}
+
+// GetProtocol returns the expected protocol for this router.
+func (r *Router) GetProtocol() string {
+	return r.protocol
+}
+
+// IsMySQL returns true if this router is configured for MySQL protocol.
+func (r *Router) IsMySQL() bool {
+	return r.protocol == "mysql"
 }
 
 // Conn is a connection proxy that handles Peeked bytes.

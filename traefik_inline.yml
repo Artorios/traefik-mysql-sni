@@ -1,0 +1,31 @@
+log:
+  level: DEBUG
+
+accessLog: {}
+
+entryPoints:
+  web:
+    address: ":80"
+  mysql:
+    address: ":3306/mysql"
+
+api:
+  dashboard: true
+  insecure: true
+
+# Встроенная конфигурация для теста
+tcp:
+  routers:
+    mysql-router:
+      entryPoints:
+        - mysql
+      rule: "HostSNI(`dev-01.myurist.online`)"
+      service: mysql-service
+      tls:
+        passthrough: true
+
+  services:
+    mysql-service:
+      loadBalancer:
+        servers:
+          - address: "62.113.100.61:3306"

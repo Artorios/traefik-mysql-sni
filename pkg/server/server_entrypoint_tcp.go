@@ -180,6 +180,16 @@ func NewTCPEntryPoint(ctx context.Context, name string, config *static.EntryPoin
 		return nil, fmt.Errorf("error preparing tcp router: %w", err)
 	}
 
+	// Set the protocol based on entrypoint configuration
+	log.Ctx(ctx).Debug().Str("entrypoint", name).Str("address", config.Address).Msg("Getting protocol from entrypoint config")
+	protocol, err := config.GetProtocol()
+	if err != nil {
+		log.Ctx(ctx).Error().Err(err).Str("entrypoint", name).Msg("Error getting protocol from config")
+		return nil, fmt.Errorf("error getting protocol: %w", err)
+	}
+	log.Ctx(ctx).Debug().Str("entrypoint", name).Str("protocol", protocol).Msg("Setting protocol for TCP router")
+	rt.SetProtocol(protocol)
+
 	reqDecorator := requestdecorator.New(hostResolverConfig)
 
 	httpServer, err := createHTTPServer(ctx, listener, config, true, reqDecorator)

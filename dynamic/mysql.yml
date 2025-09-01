@@ -1,0 +1,15 @@
+tcp:
+  routers:
+    mysql-router:
+      entryPoints:
+        - mysql
+      rule: "HostSNI(`dev-01.myurist.online`)"
+      service: mysql-service
+      tls:
+        passthrough: true
+
+  services:
+    mysql-service:
+      loadBalancer:
+        servers:
+          - address: "dev-01.myurist.online:3306"

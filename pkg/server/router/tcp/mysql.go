@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"net"
 	"sync"
 
 	"github.com/rs/zerolog/log"
@@ -58,17 +59,74 @@ func isMySQLHandshake(br *bufio.Reader) (bool, error) {
 	return false, nil
 }
 
+func sendFakeMySQLGreetingWithForceSSL(conn net.Conn) error {
+	// MySQL greeting пакет
+	// https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::Handshake
+
+	// capabilities (младшие 2 байта + старшие 2 байта)
+	// обязательно ставим CLIENT_SSL (0x0800)
+	const CLIENT_SSL = 0x0800
+
+	// возьмём базовый набор capability флагов
+	capLow := uint16(0xffff & CLIENT_SSL) // младшие 2 байта
+	capHigh := uint16((0xffff >> 16) | 0) // старшие 2 байта (можно 0 для простоты)
+
+	// Greeting packet
+	// protocol version (1 байт)
+	// server version (null-terminated string)
+	// connection id (4 байта)
+	// auth plugin data (random bytes)
+	// capability flags (2 + 2 байта)
+
+	// простой greeting
+	payload := []byte{
+		0x0a, // protocol version = 10
+	}
+	payload = append(payload, []byte("5.7.0-fake-server\x00")...) // server version
+	payload = append(payload, 0x01, 0x00, 0x00, 0x00)             // connection id
+	payload = append(payload, []byte("abcdefgh")...)              // auth-plugin-data-part-1 (8 байт)
+	payload = append(payload, 0x00)                               // filler
+
+	// capability flags (младшие 2 байта)
+	payload = append(payload, byte(capLow), byte(capLow>>8))
+
+	payload = append(payload, 0x21)       // charset (utf8_general_ci)
+	payload = append(payload, 0x00, 0x02) // status flags (autocommit)
+
+	// capability flags (старшие 2 байта)
+	payload = append(payload, byte(capHigh), byte(capHigh>>8))
+
+	payload = append(payload, 0x15) // length of auth-plugin-data
+	// reserved
+	for i := 0; i < 10; i++ {
+		payload = append(payload, 0x00)
+	}
+	payload = append(payload, []byte("ijklmnopqrstuvwxyz123456")...) // auth-plugin-data-part-2
+	payload = append(payload, 0x00)                                  // terminating 0
+
+	// auth plugin name
+	payload = append(payload, []byte("caching_sha2_password")...)
+	payload = append(payload, 0x00)
+
+	// Упаковываем в mysql packet (len[3] + seq[1] + payload)
+	packetLen := len(payload)
+	header := []byte{byte(packetLen), byte(packetLen >> 8), byte(packetLen >> 16), 0x00}
+
+	// Отправляем
+	_, err := conn.Write(append(header, payload...))
+	return err
+}
+
 // serveMySQL serves a connection with a MySQL client that may negotiate SSL/TLS.
 // It handles MySQL protocol detection and SNI extraction for routing.
 func (r *Router) serveMySQL(conn tcp.WriteCloser) {
-	log.Info().Msg("\n\n\nserveMySQL\n\n\n")
 	br := bufio.NewReader(conn)
 
 	// For MySQL, we need to send the handshake packet first to initiate SSL negotiation
 	// This is different from PostgreSQL where client sends STARTTLS request first
 
 	// Create a fake MySQL handshake packet to trigger client SSL negotiation
-	handshakePacket := createMySQLHandshakePacket()
+	handshakePacket := createMySQLHandshakePacketForceSSL()
 
 	_, err := conn.Write(handshakePacket)
 	if err != nil {
@@ -87,19 +145,25 @@ func (r *Router) serveMySQL(conn tcp.WriteCloser) {
 
 	// Check if client wants SSL
 	if !isMySQLSSLRequest(clientResponse) {
+		// If this is a strict MySQL protocol entrypoint, require SSL for SNI extraction
+		if r.IsMySQL() {
+			log.Debug().Msg("MySQL protocol requires SSL for SNI extraction - closing connection")
+			conn.Close()
+			return
+		}
 		// Handle non-SSL MySQL connection
 		r.handleNonSSLMySQL(conn, br)
 		return
 	}
 
 	// Send SSL OK response
-	sslOKPacket := createMySQLSSLOKPacket()
-	_, err = conn.Write(sslOKPacket)
-	if err != nil {
-		log.Error().Err(err).Msg("Error sending MySQL SSL OK packet")
-		conn.Close()
-		return
-	}
+	//sslOKPacket := createMySQLSSLOKPacket()
+	//_, err = conn.Write(sslOKPacket)
+	//if err != nil {
+	//	log.Error().Err(err).Msg("Error sending MySQL SSL OK packet")
+	//	conn.Close()
+	//	return
+	//}
 
 	// Now expect TLS ClientHello with SNI
 	hello, err := clientHelloInfo(br)
@@ -115,8 +179,13 @@ func (r *Router) serveMySQL(conn tcp.WriteCloser) {
 		return
 	}
 
-	log.Debug().Msg("\n\n\nSNI DETECTED! \n\n\n")
-	log.Debug().Str("sni", hello.serverName)
+	// Check if SNI is present for MySQL protocol
+	if !r.IsMySQL() || hello.serverName == "" {
+		log.Debug().Msg("MySQL protocol requires SNI for routing - closing connection")
+		conn.Close()
+		return
+	}
+
 	// Route based on SNI
 	connData, err := tcpmuxer.NewConnData(hello.serverName, conn, hello.protos)
 	if err != nil {
@@ -134,18 +203,25 @@ func (r *Router) serveMySQL(conn tcp.WriteCloser) {
 	}
 
 	// Create MySQL-aware connection wrapper
-	proxiedConn := r.GetConn(conn, hello.peeked)
-	mysqlConn := &mysqlConn{
-		WriteCloser:   proxiedConn,
-		handshakeSent: true,
-		sslNegotiated: true,
-	}
+	//proxiedConn := r.GetConn(conn, hello.peeked)
+	//mysqlConn := &mysqlConn{
+	//	WriteCloser:   proxiedConn,
+	//	handshakeSent: true,
+	//	sslNegotiated: true,
+	//}
 
-	handlerTCPTLS.ServeTCP(mysqlConn)
+	handlerTCPTLS.ServeTCP(r.GetConn(conn, hello.peeked))
 }
 
 // handleNonSSLMySQL handles non-SSL MySQL connections
 func (r *Router) handleNonSSLMySQL(conn tcp.WriteCloser, br *bufio.Reader) {
+	// If this is a MySQL protocol entrypoint, we should not handle non-SSL connections
+	if r.IsMySQL() {
+		log.Debug().Msg("MySQL protocol requires SSL - closing non-SSL connection")
+		conn.Close()
+		return
+	}
+
 	// For non-SSL connections, we can't extract SNI, so route to default handler
 	connData, err := tcpmuxer.NewConnData("", conn, nil)
 	if err != nil {
@@ -240,6 +316,84 @@ func createMySQLHandshakePacket() []byte {
 	result[3] = 0x00
 
 	// Packet data
+	copy(result[4:], packetData)
+
+	return result
+}
+
+func createMySQLHandshakePacketForceSSL() []byte {
+	// https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::Handshake
+
+	const (
+		MySQLProtocolVersion = 0x0a
+		CLIENT_SSL           = 0x0800
+	)
+
+	// capability flags (минимальный набор + SSL)
+	capabilities := uint32(CLIENT_SSL)
+
+	serverVersion := "5.7.0-fake-server\x00"
+	connectionID := []byte{0x01, 0x00, 0x00, 0x00}
+	authPluginDataPart1 := []byte("abcdefgh")                 // 8 байт
+	authPluginDataPart2 := []byte("ijklmnopqrstuvwxyz123456") // 21 байт
+	authPluginName := "caching_sha2_password\x00"
+
+	var payload bytes.Buffer
+
+	// Protocol version
+	payload.WriteByte(MySQLProtocolVersion)
+
+	// Server version (null terminated)
+	payload.WriteString(serverVersion)
+
+	// Connection ID
+	payload.Write(connectionID)
+
+	// Auth plugin data part 1
+	payload.Write(authPluginDataPart1)
+
+	// Filler
+	payload.WriteByte(0x00)
+
+	// Capabilities lower 2 bytes
+	payload.WriteByte(byte(capabilities & 0xFF))
+	payload.WriteByte(byte((capabilities >> 8) & 0xFF))
+
+	// Charset
+	payload.WriteByte(0x21) // utf8_general_ci
+
+	// Status flags
+	payload.Write([]byte{0x00, 0x02}) // autocommit
+
+	// Capabilities upper 2 bytes
+	payload.WriteByte(byte((capabilities >> 16) & 0xFF))
+	payload.WriteByte(byte((capabilities >> 24) & 0xFF))
+
+	// Length of auth plugin data
+	payload.WriteByte(byte(len(authPluginDataPart1) + len(authPluginDataPart2) + 1))
+
+	// Reserved (10 bytes)
+	payload.Write(make([]byte, 10))
+
+	// Auth plugin data part 2
+	payload.Write(authPluginDataPart2)
+
+	// Null terminator for plugin data
+	payload.WriteByte(0x00)
+
+	// Auth plugin name
+	payload.WriteString(authPluginName)
+
+	// --- Собираем в MySQL пакет (len[3] + seq[1] + payload) ---
+	packetData := payload.Bytes()
+	packetLen := len(packetData)
+
+	result := make([]byte, 4+packetLen)
+	result[0] = byte(packetLen)
+	result[1] = byte(packetLen >> 8)
+	result[2] = byte(packetLen >> 16)
+	result[3] = 0x00 // sequence id
+
 	copy(result[4:], packetData)
 
 	return result
