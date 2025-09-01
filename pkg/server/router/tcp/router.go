@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
+	"fmt"
+	"github.com/traefik/traefik/v3/pkg/tcp"
 	"io"
 	"net"
 	"net/http"
@@ -14,7 +17,6 @@ import (
 	"github.com/go-acme/lego/v4/challenge/tlsalpn01"
 	"github.com/rs/zerolog/log"
 	tcpmuxer "github.com/traefik/traefik/v3/pkg/muxer/tcp"
-	"github.com/traefik/traefik/v3/pkg/tcp"
 )
 
 const defaultBufSize = 4096
@@ -46,6 +48,23 @@ type Router struct {
 	// hostHTTPTLSConfig contains TLS configs keyed by SNI.
 	// A nil config is the hint to set up a brokenTLSRouter.
 	hostHTTPTLSConfig map[string]*tls.Config // TLS configs keyed by SNI
+}
+
+type MySQLPacketHeader struct {
+	Length     uint32 // длина payload (3 байта, но у нас храним в 4)
+	SequenceID uint8  // номер пакета (1 байт)
+	Payload    []byte // сами данные (Length байт)
+}
+
+type TLSRecordHeader struct {
+	ContentType uint8
+	Version     uint16
+	Length      uint16
+}
+
+type replayConn struct {
+	net.Conn
+	r io.Reader
 }
 
 // NewRouter returns a new TCP router.
@@ -83,8 +102,184 @@ func (r *Router) GetTLSGetClientInfo() func(info *tls.ClientHelloInfo) (*tls.Con
 	}
 }
 
+func dumpHex(data []byte) string {
+	const width = 16
+	out := "\n"
+	for i := 0; i < len(data); i += width {
+		end := i + width
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := data[i:end]
+
+		// offset
+		out += fmt.Sprintf("%04x  ", i)
+
+		// hex
+		for j := 0; j < width; j++ {
+			if j < len(chunk) {
+				out += fmt.Sprintf("%02x ", chunk[j])
+			} else {
+				out += "   "
+			}
+			if j == 7 {
+				out += " " // дополнительный пробел посередине
+			}
+		}
+
+		// ASCII справа
+		out += " |"
+		for _, b := range chunk {
+			if b >= 32 && b <= 126 {
+				out += string(b)
+			} else {
+				out += "."
+			}
+		}
+		out += "|\n"
+	}
+	return out
+}
+
+func sendFakeMySQLGreetingForceSSL(conn net.Conn) error {
+	// MySQL greeting пакет
+	// https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::Handshake
+
+	// capabilities (младшие 2 байта + старшие 2 байта)
+	// обязательно ставим CLIENT_SSL (0x0800)
+	const CLIENT_SSL = 0x0800
+
+	// возьмём базовый набор capability флагов
+	capLow := uint16(0xffff & CLIENT_SSL) // младшие 2 байта
+	capHigh := uint16((0xffff >> 16) | 0) // старшие 2 байта (можно 0 для простоты)
+
+	// Greeting packet
+	// protocol version (1 байт)
+	// server version (null-terminated string)
+	// connection id (4 байта)
+	// auth plugin data (random bytes)
+	// capability flags (2 + 2 байта)
+
+	// простой greeting
+	payload := []byte{
+		0x0a, // protocol version = 10
+	}
+	payload = append(payload, []byte("5.7.0-fake-server\x00")...) // server version
+	payload = append(payload, 0x01, 0x00, 0x00, 0x00)             // connection id
+	payload = append(payload, []byte("abcdefgh")...)              // auth-plugin-data-part-1 (8 байт)
+	payload = append(payload, 0x00)                               // filler
+
+	// capability flags (младшие 2 байта)
+	payload = append(payload, byte(capLow), byte(capLow>>8))
+
+	payload = append(payload, 0x21)       // charset (utf8_general_ci)
+	payload = append(payload, 0x00, 0x02) // status flags (autocommit)
+
+	// capability flags (старшие 2 байта)
+	payload = append(payload, byte(capHigh), byte(capHigh>>8))
+
+	payload = append(payload, 0x15) // length of auth-plugin-data
+	// reserved
+	for i := 0; i < 10; i++ {
+		payload = append(payload, 0x00)
+	}
+	payload = append(payload, []byte("ijklmnopqrstuvwxyz123456")...) // auth-plugin-data-part-2
+	payload = append(payload, 0x00)                                  // terminating 0
+
+	// auth plugin name
+	payload = append(payload, []byte("caching_sha2_password")...)
+	payload = append(payload, 0x00)
+
+	// Упаковываем в mysql packet (len[3] + seq[1] + payload)
+	packetLen := len(payload)
+	header := []byte{byte(packetLen), byte(packetLen >> 8), byte(packetLen >> 16), 0x00}
+
+	// Отправляем
+	_, err := conn.Write(append(header, payload...))
+	return err
+}
+
+func readMysqlAnswer(conn net.Conn) (*MySQLPacketHeader, error) {
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return nil, fmt.Errorf("read header: %w", err)
+	}
+
+	// длина в 3 байта (little endian)
+	length := uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16
+	seqID := header[3]
+
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		return nil, fmt.Errorf("read payload: %w", err)
+	}
+
+	return &MySQLPacketHeader{
+		Length:     length,
+		SequenceID: seqID,
+		Payload:    payload,
+	}, nil
+}
+
+// читаем TLS Record (header + body)
+func readTLSRecord(br *bufio.Reader) ([]byte, *TLSRecordHeader, error) {
+	headerBytes := make([]byte, 5)
+	if _, err := io.ReadFull(br, headerBytes); err != nil {
+		return nil, nil, fmt.Errorf("read tls header: %w", err)
+	}
+
+	h := &TLSRecordHeader{
+		ContentType: headerBytes[0],
+		Version:     binary.BigEndian.Uint16(headerBytes[1:3]),
+		Length:      binary.BigEndian.Uint16(headerBytes[3:5]),
+	}
+
+	body := make([]byte, h.Length)
+	if _, err := io.ReadFull(br, body); err != nil {
+		return nil, nil, fmt.Errorf("read tls body: %w", err)
+	}
+	full := append(headerBytes, body...)
+	return full, h, nil
+}
+
+func (c *replayConn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
+}
+
+func newReplayConn(base net.Conn, first []byte, br *bufio.Reader) net.Conn {
+	return &replayConn{
+		Conn: base,
+		r:    io.MultiReader(bytes.NewReader(first), br),
+	}
+}
+
+func getTLSbody(c net.Conn) *bufio.Reader {
+
+	br := bufio.NewReader(c)
+
+	// читаем один TLS Record
+	bodyTLS, h, err := readTLSRecord(br)
+	if err != nil {
+		fmt.Println("ERR:", err)
+		return nil
+	}
+	if h.ContentType != 0x16 { // Handshake
+		fmt.Println("not a TLS Handshake record")
+		return nil
+	}
+
+	r := io.MultiReader(bytes.NewReader(bodyTLS), br)
+	return bufio.NewReader(r)
+	//newReplayConn(c, bodyTLS, br)
+}
+
 // ServeTCP forwards the connection to the right TCP/HTTP handler.
 func (r *Router) ServeTCP(conn tcp.WriteCloser) {
+	log.Info().Msg("ServeTCP!!!!!!")
+	remoteAddr := conn.RemoteAddr().String() // IP:порт
+	log.Info().
+		Str("remoteAddr", remoteAddr).
+		Msg("ServeTCP connection accepted")
 	// Handling Non-TLS TCP connection early if there is neither HTTP(S) nor TLS routers on the entryPoint,
 	// and if there is at least one non-TLS TCP router.
 	// In the case of a non-TLS TCP client (that does not "send" first),
@@ -118,41 +313,65 @@ func (r *Router) ServeTCP(conn tcp.WriteCloser) {
 
 	// TODO -- Check if ProxyProtocol changes the first bytes of the request
 	br := bufio.NewReader(conn)
-	
-	// Check for MySQL handshake first
-	mysql, err := isMySQLHandshake(br)
-	if err != nil {
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	if err := sendFakeMySQLGreetingForceSSL(conn); err != nil {
+		log.Error().Err(err).Msg("failed to send fake mysql greeting")
 		conn.Close()
 		return
 	}
 
-	if mysql {
-		// Remove read/write deadline and delegate this to underlying TCP server.
-		if err := conn.SetDeadline(time.Time{}); err != nil {
-			log.Error().Err(err).Msg("Error while setting deadline")
+	log.Info().Msg("Fake MySQL greeting sent, waiting for client response")
+
+	packetTLS, _ := readMysqlAnswer(conn)
+	log.Info().Msgf("\npayload:%s", dumpHex(packetTLS.Payload))
+	br = getTLSbody(conn)
+
+	//hello1, err1 := clientHelloInfo(br)
+	//if err1 != nil {
+	//	conn.Close()
+	//	return
+	//}
+	//log.Info().Msgf("\npayload:%s", hello1.serverName)
+
+	//// Check for MySQL handshake first
+	//mysql, err := isMySQLHandshake(br)
+	//if err != nil {
+	//	log.Info().Msg("isMySQLHandshake => false, close connection")
+	//	conn.Close()
+	//	return
+	//}
+	//
+	//log.Info().Msg("isMySQLHandshake => true")
+	//
+	//if mysql {
+	//	log.Info().Msg("\n\n\nMySQLHandshake Detected!!!!\n\n\n")
+	//	// Remove read/write deadline and delegate this to underlying TCP server.
+	//	if err := conn.SetDeadline(time.Time{}); err != nil {
+	//		log.Error().Err(err).Msg("Error while setting deadline")
+	//	}
+	//
+	//	r.serveMySQL(r.GetConn(conn, getPeeked(br)))
+	//	return
+	//}
+
+	/*
+		// Check for PostgreSQL STARTTLS
+		postgres, err := isPostgres(br)
+		if err != nil {
+			conn.Close()
+			return
 		}
 
-		r.serveMySQL(r.GetConn(conn, getPeeked(br)))
-		return
-	}
-	
-	// Check for PostgreSQL STARTTLS
-	postgres, err := isPostgres(br)
-	if err != nil {
-		conn.Close()
-		return
-	}
+		if postgres {
+			// Remove read/write deadline and delegate this to underlying TCP server.
+			if err := conn.SetDeadline(time.Time{}); err != nil {
+				log.Error().Err(err).Msg("Error while setting deadline")
+			}
 
-	if postgres {
-		// Remove read/write deadline and delegate this to underlying TCP server.
-		if err := conn.SetDeadline(time.Time{}); err != nil {
-			log.Error().Err(err).Msg("Error while setting deadline")
+			r.servePostgres(r.GetConn(conn, getPeeked(br)))
+			return
 		}
-
-		r.servePostgres(r.GetConn(conn, getPeeked(br)))
-		return
-	}
-
+	*/
 	hello, err := clientHelloInfo(br)
 	if err != nil {
 		conn.Close()

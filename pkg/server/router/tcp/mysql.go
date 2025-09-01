@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"net"
 	"sync"
 
 	"github.com/rs/zerolog/log"
@@ -17,10 +16,10 @@ import (
 var (
 	// MySQL Protocol Version 10 (MySQL 5.6+)
 	MySQLProtocolVersion = byte(10)
-	
+
 	// MySQL capability flags for SSL support
 	MySQLClientSSL = uint32(0x0800)
-	
+
 	// MySQL packet header size (4 bytes: 3 for length + 1 for sequence)
 	MySQLPacketHeaderSize = 4
 )
@@ -36,54 +35,41 @@ type MySQLHandshakePacket struct {
 
 // isMySQLHandshake determines whether the buffer contains a MySQL handshake packet.
 func isMySQLHandshake(br *bufio.Reader) (bool, error) {
-	// Peek the first 5 bytes (packet header + protocol version)
+	log.Info().Msg("isMySQLHandshake")
 	peeked, err := br.Peek(5)
 	if err != nil {
-		var opErr *net.OpError
-		if !errors.Is(err, io.EOF) && (!errors.As(err, &opErr) || !opErr.Timeout()) {
-			log.Debug().Err(err).Msg("Error while peeking MySQL handshake bytes")
+		if errors.Is(err, io.EOF) {
+			return false, nil
 		}
 		return false, err
 	}
 
-	// Check if this looks like a MySQL handshake packet
-	// First 3 bytes are packet length (little endian)
-	// 4th byte is sequence number (should be 0 for handshake)
-	// 5th byte is protocol version (should be 10 for MySQL 5.6+)
-	if len(peeked) < 5 {
-		return false, nil
+	// Первые 3 байта — длина пакета (little endian)
+	length := int(peeked[0]) | int(peeked[1])<<8 | int(peeked[2])<<16
+	seq := peeked[3]
+	protocol := peeked[4]
+
+	// Проверяем что sequence = 0 и protocol version = 0x0a
+	if seq == 0x00 && protocol == 0x0a && length > 0 {
+		log.Info().Msg("isMySQLHandshake: MySql Detected!!!!")
+		return true, nil
 	}
 
-	// Sequence number should be 0 for initial handshake
-	if peeked[3] != 0 {
-		return false, nil
-	}
-
-	// Protocol version should be 10
-	if peeked[4] != MySQLProtocolVersion {
-		return false, nil
-	}
-
-	// Additional validation: packet length should be reasonable (> 20 bytes for handshake)
-	packetLength := uint32(peeked[0]) | uint32(peeked[1])<<8 | uint32(peeked[2])<<16
-	if packetLength < 20 || packetLength > 16777215 { // Max MySQL packet size
-		return false, nil
-	}
-
-	return true, nil
+	return false, nil
 }
 
 // serveMySQL serves a connection with a MySQL client that may negotiate SSL/TLS.
 // It handles MySQL protocol detection and SNI extraction for routing.
 func (r *Router) serveMySQL(conn tcp.WriteCloser) {
+	log.Info().Msg("\n\n\nserveMySQL\n\n\n")
 	br := bufio.NewReader(conn)
-	
+
 	// For MySQL, we need to send the handshake packet first to initiate SSL negotiation
 	// This is different from PostgreSQL where client sends STARTTLS request first
-	
+
 	// Create a fake MySQL handshake packet to trigger client SSL negotiation
 	handshakePacket := createMySQLHandshakePacket()
-	
+
 	_, err := conn.Write(handshakePacket)
 	if err != nil {
 		log.Error().Err(err).Msg("Error sending MySQL handshake packet")
@@ -129,6 +115,8 @@ func (r *Router) serveMySQL(conn tcp.WriteCloser) {
 		return
 	}
 
+	log.Debug().Msg("\n\n\nSNI DETECTED! \n\n\n")
+	log.Debug().Str("sni", hello.serverName)
 	// Route based on SNI
 	connData, err := tcpmuxer.NewConnData(hello.serverName, conn, hello.protos)
 	if err != nil {
@@ -148,7 +136,7 @@ func (r *Router) serveMySQL(conn tcp.WriteCloser) {
 	// Create MySQL-aware connection wrapper
 	proxiedConn := r.GetConn(conn, hello.peeked)
 	mysqlConn := &mysqlConn{
-		WriteCloser: proxiedConn,
+		WriteCloser:   proxiedConn,
 		handshakeSent: true,
 		sslNegotiated: true,
 	}
@@ -170,7 +158,7 @@ func (r *Router) handleNonSSLMySQL(conn tcp.WriteCloser, br *bufio.Reader) {
 	if handler != nil {
 		proxiedConn := r.GetConn(conn, getPeeked(br))
 		mysqlConn := &mysqlConn{
-			WriteCloser: proxiedConn,
+			WriteCloser:   proxiedConn,
 			handshakeSent: true,
 			sslNegotiated: false,
 		}
@@ -184,76 +172,76 @@ func (r *Router) handleNonSSLMySQL(conn tcp.WriteCloser, br *bufio.Reader) {
 func createMySQLHandshakePacket() []byte {
 	// Simplified MySQL handshake packet for SSL negotiation
 	// This is a minimal implementation to trigger SSL negotiation
-	
+
 	serverVersion := "8.0.0-traefik\x00" // Null-terminated server version
 	authPluginData := make([]byte, 8)    // First part of auth data
-	
+
 	// Capability flags (including SSL support)
 	capabilities := MySQLClientSSL | 0x0001 | 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0200
-	
+
 	var packet bytes.Buffer
-	
+
 	// Protocol version
 	packet.WriteByte(MySQLProtocolVersion)
-	
+
 	// Server version
 	packet.WriteString(serverVersion)
-	
+
 	// Connection ID (4 bytes)
 	packet.Write([]byte{0x01, 0x00, 0x00, 0x00})
-	
+
 	// First part of auth plugin data (8 bytes)
 	packet.Write(authPluginData)
-	
+
 	// Filler (1 byte)
 	packet.WriteByte(0x00)
-	
+
 	// Capability flags lower 2 bytes
 	packet.WriteByte(byte(capabilities & 0xFF))
 	packet.WriteByte(byte((capabilities >> 8) & 0xFF))
-	
+
 	// Character set (1 byte)
 	packet.WriteByte(0x21) // utf8_general_ci
-	
+
 	// Status flags (2 bytes)
 	packet.Write([]byte{0x00, 0x00})
-	
+
 	// Capability flags upper 2 bytes
 	packet.WriteByte(byte((capabilities >> 16) & 0xFF))
 	packet.WriteByte(byte((capabilities >> 24) & 0xFF))
-	
+
 	// Auth plugin data length
 	packet.WriteByte(0x15) // 21 bytes total auth data length
-	
+
 	// Reserved (10 bytes)
 	packet.Write(make([]byte, 10))
-	
+
 	// Second part of auth plugin data (12 bytes)
 	packet.Write(make([]byte, 12))
-	
+
 	// Null terminator
 	packet.WriteByte(0x00)
-	
+
 	// Auth plugin name
 	packet.WriteString("mysql_native_password\x00")
-	
+
 	// Create packet with header
 	packetData := packet.Bytes()
 	packetLength := len(packetData)
-	
+
 	result := make([]byte, 4+packetLength)
-	
+
 	// Packet length (3 bytes, little endian)
 	result[0] = byte(packetLength & 0xFF)
 	result[1] = byte((packetLength >> 8) & 0xFF)
 	result[2] = byte((packetLength >> 16) & 0xFF)
-	
+
 	// Sequence number
 	result[3] = 0x00
-	
+
 	// Packet data
 	copy(result[4:], packetData)
-	
+
 	return result
 }
 
@@ -268,7 +256,7 @@ func readMySQLPacket(br *bufio.Reader) ([]byte, error) {
 
 	// Extract packet length
 	packetLength := uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16
-	
+
 	// Read packet data
 	packetData := make([]byte, packetLength)
 	_, err = io.ReadFull(br, packetData)
@@ -280,7 +268,7 @@ func readMySQLPacket(br *bufio.Reader) ([]byte, error) {
 	result := make([]byte, 4+packetLength)
 	copy(result[:4], header)
 	copy(result[4:], packetData)
-	
+
 	return result, nil
 }
 
@@ -292,14 +280,14 @@ func isMySQLSSLRequest(packet []byte) bool {
 
 	// Skip packet header (4 bytes)
 	data := packet[4:]
-	
+
 	if len(data) < 4 {
 		return false
 	}
 
 	// Extract capability flags from client packet
 	capabilities := uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16 | uint32(data[3])<<24
-	
+
 	// Check if SSL capability is set
 	return (capabilities & MySQLClientSSL) != 0
 }
@@ -315,10 +303,10 @@ func createMySQLSSLOKPacket() []byte {
 // It handles the MySQL protocol handshake state
 type mysqlConn struct {
 	tcp.WriteCloser
-	
+
 	handshakeSent bool
 	sslNegotiated bool
-	
+
 	// For handling the protocol state
 	mu sync.Mutex
 }
@@ -327,14 +315,14 @@ type mysqlConn struct {
 func (c *mysqlConn) Read(p []byte) (n int, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	return c.WriteCloser.Read(p)
 }
 
-// Write implements the MySQL protocol state machine for writes  
+// Write implements the MySQL protocol state machine for writes
 func (c *mysqlConn) Write(p []byte) (n int, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	return c.WriteCloser.Write(p)
 }
