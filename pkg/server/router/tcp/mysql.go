@@ -3,12 +3,10 @@ package tcp
 import (
 	"bufio"
 	"bytes"
-	"fmt"
 	"github.com/rs/zerolog/log"
 	tcpmuxer "github.com/traefik/traefik/v3/pkg/muxer/tcp"
 	"github.com/traefik/traefik/v3/pkg/tcp"
 	"io"
-	"sync"
 )
 
 var (
@@ -17,9 +15,6 @@ var (
 
 	// MySQL capability flags for SSL support
 	MySQLClientSSL = uint32(0x0800)
-
-	// MySQL packet header size (4 bytes: 3 for length + 1 for sequence)
-	MySQLPacketHeaderSize = 4
 )
 
 type MySQLHandshakePacket struct {
@@ -30,53 +25,9 @@ type MySQLHandshakePacket struct {
 	CapabilityFlags uint32
 }
 
-// hexdump печатает данные в стиле xxd
-func hexdump(data []byte) {
-	const bytesPerLine = 16
-	length := len(data)
-	if length > 0x200 {
-		length = 0x200
-	}
-
-	for i := 0; i < length; i += bytesPerLine {
-		// адрес (смещение)
-		fmt.Printf("%08x: ", i)
-
-		// байты
-		end := i + bytesPerLine
-		if end > length {
-			end = length
-		}
-		for j := i; j < end; j++ {
-			fmt.Printf("%02x ", data[j])
-			// для читаемости делаем пробел после 8 байт
-			if (j-i+1)%8 == 0 {
-				fmt.Print(" ")
-			}
-		}
-
-		// паддинг если строка короткая
-		for j := end; j < i+bytesPerLine; j++ {
-			fmt.Print("   ")
-			if (j-i+1)%8 == 0 {
-				fmt.Print(" ")
-			}
-		}
-
-		// ascii справа
-		fmt.Print(" ")
-		for j := i; j < end; j++ {
-			c := data[j]
-			if c >= 32 && c <= 126 {
-				fmt.Printf("%c", c)
-			} else {
-				fmt.Print(".")
-			}
-		}
-		fmt.Println()
-	}
-}
-
+// serveMySQL handles MySQL protocol connections with TLS passthrough.
+// It sends a fake handshake to the client, extracts SNI from the client's TLS ClientHello,
+// and creates a mysqlConn to handle the handshake replay to the backend.
 func (r *Router) serveMySQL(conn tcp.WriteCloser) {
 	br := bufio.NewReader(conn)
 
@@ -148,9 +99,8 @@ func (r *Router) serveMySQL(conn tcp.WriteCloser) {
 
 	// Create mysqlConn with client data for proper handshake replay
 	mysqlConn := &mysqlConn{
-		WriteCloser:     r.GetConn(conn, hello.peeked),
-		clientSqlPacket: clientResponse,
-		clientTLSHello:  []byte(hello.peeked),
+		WriteCloser:      r.GetConn(conn, hello.peeked),
+		clientSSLRequest: clientResponse,
 	}
 
 	handlerTCPTLS.ServeTCP(mysqlConn)
@@ -184,6 +134,9 @@ func (r *Router) handleNonSSLMySQL(conn tcp.WriteCloser, br *bufio.Reader) {
 	}
 }
 
+// createMySQLHandshakePacketForceSSL creates a fake MySQL handshake packet
+// that forces the client to initiate SSL negotiation.
+// This packet is based on a real MySQL 8.0.43 handshake captured from Wireshark.
 func createMySQLHandshakePacketForceSSL() []byte {
 	// Real MySQL handshake packet from server (captured from Wireshark)
 	// This is the exact handshake packet that forces SSL negotiation
@@ -219,6 +172,7 @@ func createMySQLHandshakePacketForceSSL() []byte {
 	return realHandshakePacket
 }
 
+// readMySQLPacket reads a complete MySQL packet (header + payload) from the connection.
 func readMySQLPacket(br *bufio.Reader) ([]byte, error) {
 	// Read packet header (4 bytes)
 	header := make([]byte, 4)
@@ -245,6 +199,8 @@ func readMySQLPacket(br *bufio.Reader) ([]byte, error) {
 	return result, nil
 }
 
+// isMySQLSSLRequest checks if a MySQL packet contains an SSL request.
+// It examines the capability flags in the client packet to determine if SSL is requested.
 func isMySQLSSLRequest(packet []byte) bool {
 	if len(packet) < 8 { // Header + minimum SSL request size
 		return false
@@ -264,48 +220,60 @@ func isMySQLSSLRequest(packet []byte) bool {
 	return (capabilities & MySQLClientSSL) != 0
 }
 
+// mysqlConn wraps a TCP connection to handle MySQL TLS handshake passthrough.
+// It stores the client's SSL request packet and replays it to the backend server.
 type mysqlConn struct {
 	tcp.WriteCloser
-	handshakeReceived bool
-	flag              bool
-	clientSqlPacket   []byte
-	clientTLSHello    []byte
-	errChanMu         sync.Mutex
-	errChan           chan error
+
+	// Connection state
+	handshakeCompleted bool // whether the initial handshake phase is completed
+	proxyMode          bool // whether we're in normal proxy mode (after handshake)
+
+	// Client data to replay to backend
+	clientSSLRequest []byte // the original SSL request packet from client
 }
 
-// принять данные от сервера
+// Read reads data from the backend server.
+// On first call, it replays the client's SSL request to the backend.
+// Subsequent calls proxy data normally from backend to client.
 func (c *mysqlConn) Read(p []byte) (n int, err error) {
-	if c.handshakeReceived {
+	// If handshake is completed, proxy data normally
+	if c.handshakeCompleted {
 		return c.WriteCloser.Read(p)
 	}
 
+	// First call: replay client's SSL request to backend
 	defer func() {
-		c.handshakeReceived = true
-		c.errChanMu.Lock()
-		c.errChan = make(chan error)
-		c.errChanMu.Unlock()
+		c.handshakeCompleted = true
 	}()
 
-	copy(p, c.clientSqlPacket)
-
-	return len(c.clientSqlPacket), nil
-
+	// Send the client's SSL request packet to the backend
+	copy(p, c.clientSSLRequest)
+	return len(c.clientSSLRequest), nil
 }
 
-// отправить данные клиенту
+// Write writes data to the client.
+// On first call, it processes the backend's MySQL handshake response.
+// Subsequent calls proxy data normally from backend to client.
 func (c *mysqlConn) Write(p []byte) (n int, err error) {
-	if c.flag {
+	// If we're in proxy mode, forward all data to client
+	if c.proxyMode {
 		return c.WriteCloser.Write(p)
 	}
 
+	// First call: process backend's MySQL handshake response
 	defer func() {
-		c.flag = true
+		c.proxyMode = true
 	}()
+
+	// Parse the MySQL packet from backend response
 	br := bufio.NewReader(bytes.NewReader(p))
+	backendResponse, err := readMySQLPacket(br)
+	if err != nil {
+		return 0, err
+	}
 
-	clientResponse, err := readMySQLPacket(br)
-	copy(p, clientResponse)
-
-	return len(clientResponse), nil
+	// Forward the parsed MySQL response to client
+	copy(p, backendResponse)
+	return len(backendResponse), nil
 }
